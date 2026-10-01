@@ -147,6 +147,59 @@ docker compose ps          # esperar a que kafka/postgres/spark estén healthy
 * Spark UI: http://localhost:8080
 * Kafka (desde el host): `localhost:9094`
 
+### En Windows
+
+Todo corre dentro de contenedores, así que el proyecto funciona igual. Las
+diferencias son de entorno, no de código.
+
+**Requisitos**
+
+1. **Docker Desktop con WSL2** (obligatorio). En *Settings → General* activá
+   *Use the WSL 2 based engine*. Es lo que hace que los bind mounts y el
+   networking funcionen bien.
+2. **Memoria**: la imagen de Spark necesita RAM. En *Settings → Resources* subí
+   a **6 GB** (mínimo 4). Con los valores por defecto de Windows el build o el
+   job se pueden morir por falta de memoria.
+3. **Disco**: activá *Virtual disk limit* en un espacio razonable si querés
+   evitar que crezca sin control; el build de la imagen de Spark baja unos
+   cientos de MB.
+
+**Clonar y arrancar** (PowerShell o CMD)
+
+```powershell
+git clone https://github.com/DuvanSanchez12/proyecto-kafka.git
+cd proyecto-kafka
+copy .env.example .env
+docker compose up --build -d
+docker compose ps
+```
+
+Dos diferencias concretas respecto a macOS/Linux:
+
+- **Finales de línea.** El repo trae un `.gitattributes` que fuerza LF, así que
+  Git en Windows no convierte los `.yml`, `Dockerfile`, `.sh` ni `.sql` a CRLF.
+  Sin eso, los scripts que corren *dentro* de los contenedores fallarían con
+  errores raros tipo `\r: command not found`. Si clonás un fork viejo, borrá la
+  carpeta y volvé a clonar para que aplique.
+- **Rutas montadas.** Solo hay un bind mount, `./db/init`, y Compose lo traduce
+  solo. No hace falta tocar rutas ni usar `C:\...`.
+
+**Comandos útiles en PowerShell**
+
+```powershell
+docker compose logs -f spark-job     # micro-lotes en vivo
+docker compose ps                     # estado de los servicios
+docker compose down                   # parar (conserva los datos)
+docker compose down -v                # parar y borrar los datos
+```
+
+Si PowerShell se queja de que no reconoce `docker`, reiniciá la terminal tras
+instalar Docker Desktop: el PATH se agrega al final de la instalación.
+
+**Si tenés WSL2 y preferís trabajar desde la distro**, el flujo es idéntico al
+de Linux: `cp .env.example .env && docker compose up --build -d`. Es la opción
+más cómoda si ya usás la terminal de Ubuntu.
+
 El productor empieza a publicar apenas Kafka está disponible y Spark cierra un
 micro-lote cada `SPARK_TRIGGER` segundos (10 por defecto). En ~1 minuto ya hay
 KPIs, tendencia y grafo.
@@ -157,6 +210,10 @@ Para escalar el volumen:
 PRODUCER_RATE=200 docker compose up -d producer
 docker compose up -d --scale spark-worker=2   # (ajustar cores/memoria)
 ```
+
+O más simple y multiplataforma: cambiá `PRODUCER_RATE` en `.env` y recreá el
+servicio. En Windows con PowerShell, `PRODUCER_RATE=200 docker compose up -d`
+**no** funciona (esa sintaxis es de bash); usá el `.env`.
 
 ---
 
@@ -203,7 +260,8 @@ discrepancias** entre distintos tamaños de caso base.
 ```
 proyecto-kafka/
 ├── docker-compose.yml
-├── .env.example
+├── .env.example                   # plantilla (copiar a .env)
+├── .gitattributes                 # fuerza LF: necesario en Windows/WSL2
 ├── db/init/01_schema.sql          # tablas, vistas, índices
 ├── producer/app/                  # corpus sintético + publisher Kafka
 ├── spark/
