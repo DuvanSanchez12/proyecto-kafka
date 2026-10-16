@@ -89,6 +89,44 @@ services:
   # -------------------------------------------------------------------
   # Productor: API sintetica -> topic Kafka
   # -------------------------------------------------------------------
+  producer-x:
+    build:
+      context: ./producer
+    <<: *common
+    container_name: bp-producer-x
+    command: ["python", "-m", "app.producer_x"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BROKERS: ${KAFKA_BROKERS}
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      BRAND: ${BRAND}
+      PRODUCER_X_RATE: ${PRODUCER_X_RATE:-12}
+
+  # Productor 2: fuente simulada estilo Reddit -> mismo topic Kafka
+  producer-reddit:
+    build:
+      context: ./producer
+    <<: *common
+    container_name: bp-producer-reddit
+    command: ["python", "-m", "app.producer_reddit"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BROKERS: ${KAFKA_BROKERS}
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      BRAND: ${BRAND}
+      PRODUCER_REDDIT_RATE: ${PRODUCER_REDDIT_RATE:-12}
+
+  # -------------------------------------------------------------------
+  # Productor: API sintetica -> topic Kafka
+  # -------------------------------------------------------------------
   producer:
     build:
       context: ./producer
