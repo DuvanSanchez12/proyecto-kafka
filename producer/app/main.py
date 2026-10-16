@@ -1,11 +1,4 @@
-"""
-Productor: simula la API de una plataforma social y publica menciones
-de la marca al topic de Kafka en tiempo real.
-
-En produccion este modulo se reemplaza por el cliente real de X o Reddit;
-la contraparte (Spark Structured Streaming) no cambia porque el contrato
-es el mismo: JSON con la clave ``mention_id`` en el valor del mensaje.
-"""
+"""Base compartida por los dos productores de BrandPulse."""
 
 from __future__ import annotations
 
@@ -31,6 +24,8 @@ BRAND = os.getenv("BRAND", "Nike")
 RATE = float(os.getenv("PRODUCER_RATE", "25"))
 PLATFORMS = [p.strip() for p in os.getenv("PLATFORMS", "x,reddit,instagram").split(",") if p.strip()]
 AUTHOR_POOL_SIZE = int(os.getenv("AUTHOR_POOL_SIZE", "220"))
+SOURCE = os.getenv("PRODUCER_SOURCE", "simulador")
+PRODUCER_ID = os.getenv("PRODUCER_ID", "brandpulse-producer")
 
 _running = True
 
@@ -59,7 +54,30 @@ def build_author_pool(size: int) -> list[str]:
     return pool
 
 
-def main() -> int:
+class MentionProducer:
+    """Productor Kafka configurable mediante argumentos de constructor."""
+
+    def __init__(self, source: str, platforms: list[str], rate: float | None = None):
+        self.source = source
+        self.platforms = platforms
+        self.rate = RATE if rate is None else rate
+        self.producer = Producer(
+            {
+                "bootstrap.servers": BROKERS,
+                "client.id": f"{PRODUCER_ID}-{uuid.uuid4().hex[:6]}",
+                "linger.ms": 20,
+                "batch.num.messages": 500,
+                "acks": "1",
+                "compression.type": "snappy",
+                "queue.buffering.max.messages": 200000,
+            }
+        )
+
+    def run(self) -> int:
+        return run_producer(self.producer, self.source, self.platforms, self.rate)
+
+
+def run_producer(producer: Producer, source: str, platforms: list[str], rate: float) -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [PRODUCER] %(levelname)-7s %(message)s",
@@ -67,18 +85,6 @@ def main() -> int:
     )
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-
-    producer = Producer(
-        {
-            "bootstrap.servers": BROKERS,
-            "client.id": f"brandpulse-producer-{uuid.uuid4().hex[:6]}",
-            "linger.ms": 20,
-            "batch.num.messages": 500,
-            "acks": "1",
-            "compression.type": "snappy",
-            "queue.buffering.max.messages": 200000,
-        }
-    )
 
     LOG.info("Conectando a Kafka en %s (topic=%s)", BROKERS, TOPIC)
     while True:
@@ -88,19 +94,20 @@ def main() -> int:
             time.sleep(3)
             continue
         break
-    LOG.info("Kafka disponible. Publicando menciones de '%s' a %d msg/s", BRAND, int(RATE))
+    LOG.info("Kafka disponible. Fuente=%s marca='%s' ritmo=%d msg/s", source, BRAND, int(rate))
 
     authors = build_author_pool(AUTHOR_POOL_SIZE)
-    interval = 1.0 / max(RATE, 0.1)
+    interval = 1.0 / max(rate, 0.1)
     sent = 0
     next_tick = time.perf_counter()
 
     while _running:
-        payload = corpus.make_mention(BRAND, authors, random.choice(PLATFORMS))
+        payload = corpus.make_mention(BRAND, authors, random.choice(platforms))
         message = {
             "mention_id": uuid.uuid4().hex,
             "ts": datetime.now(timezone.utc).isoformat(),
             "brand": BRAND,
+            "source": source,
             **payload,
         }
         try:
@@ -129,6 +136,11 @@ def main() -> int:
     producer.flush(10)
     LOG.info("Productor detenido tras %d mensajes", sent)
     return 0
+
+
+def main() -> int:
+    """Punto de entrada compatible para ejecucion manual del productor base."""
+    return MentionProducer(SOURCE, PLATFORMS).run()
 
 
 if __name__ == "__main__":

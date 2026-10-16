@@ -48,6 +48,7 @@ MESSAGE_SCHEMA = StructType(
         StructField("mention_id", StringType(), True),
         StructField("ts", TimestampType(), True),
         StructField("brand", StringType(), True),
+        StructField("source", StringType(), True),
         StructField("author", StringType(), True),
         StructField("platform", StringType(), True),
         StructField("text", StringType(), True),
@@ -97,6 +98,16 @@ def main() -> int:
     )
 
     dsn = sink.dsn(settings)
+    neo4j_cfg = (settings.neo4j.uri, settings.neo4j.username, settings.neo4j.password)
+
+    # Siembra inicial del grafo: reconstruye Neo4j desde el historico de
+    # Postgres una sola vez. A partir de aqui el grafo crece de forma
+    # incremental, un micro-lote a la vez.
+    try:
+        seeded = sink.seed_graph(settings.graph_limit, neo4j_cfg=neo4j_cfg)
+        LOG.info("grafo sembrado en Neo4j: %s nodos iniciales", seeded)
+    except Exception as exc:  # noqa: BLE001 - el streaming debe arrancar igual
+        LOG.warning("no se pudo sembrar el grafo en Neo4j: %s", exc)
 
     def process_batch(batch_df, batch_id: int) -> None:
         batch_df.persist()
@@ -104,17 +115,19 @@ def main() -> int:
             if batch_df.rdd.isEmpty():
                 return
 
-            counters = batch_df.rdd.mapPartitions(
-                lambda rows: sink.analyze_partition(rows, dsn)
+            state = batch_df.rdd.mapPartitions(
+                lambda rows: sink.analyze_partition(rows, settings.database)
             ).reduce(lambda left, right: left + right)
 
-            sink.refresh_snapshot(dsn, settings.graph_limit)
+            counters = state.counters
+            sink.refresh_buckets(dsn)
+            applied = sink.apply_graph(int(batch_id), state.delta, neo4j_cfg=neo4j_cfg)
             sink.record_batch(dsn, settings.brand, int(batch_id), counters)
 
             summary = counters.as_dict()
             LOG.info(
                 "lote %s | mensajes=%s exactitud=%.2f%% comparaciones=%s "
-                "(teorico>=%s) mezclas=%s niveles=%s",
+                "(teorico>=%s) mezclas=%s niveles=%s | grafo: %s nodos, %s aristas%s",
                 batch_id,
                 summary["messages"],
                 summary["accuracy"],
@@ -122,6 +135,9 @@ def main() -> int:
                 summary["theoretical_min"],
                 summary["merges"],
                 summary["levels"],
+                len(state.delta.nodes),
+                len(state.delta.edges),
+                "" if applied else " (ya aplicado)",
             )
         finally:
             batch_df.unpersist()

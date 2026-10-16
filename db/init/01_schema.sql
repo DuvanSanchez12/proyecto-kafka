@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS mentions (
     mention_id        TEXT PRIMARY KEY,
     ts                TIMESTAMPTZ NOT NULL,
     brand             TEXT NOT NULL,
+    source            TEXT NOT NULL DEFAULT 'desconocida',
     platform          TEXT NOT NULL,
     author            TEXT NOT NULL,
     author_followers  INTEGER NOT NULL DEFAULT 0,
@@ -29,6 +30,9 @@ CREATE TABLE IF NOT EXISTS mentions (
     processed_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Permite actualizar el volumen existente sin eliminar los datos anteriores.
+ALTER TABLE mentions ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'desconocida';
+
 CREATE INDEX IF NOT EXISTS idx_mentions_ts        ON mentions (ts DESC);
 CREATE INDEX IF NOT EXISTS idx_mentions_sentiment ON mentions (sentiment);
 CREATE INDEX IF NOT EXISTS idx_mentions_platform  ON mentions (platform);
@@ -44,34 +48,7 @@ CREATE TABLE IF NOT EXISTS sentiment_buckets (
     PRIMARY KEY (bucket, sentiment)
 );
 
--- ---------------------------------------------------------------------
--- 3. Instantanea del grafo de co-ocurrencia (marca / usuario / hashtag /
---    palabra clave). Se recalcula y reemplaza por completo en cada
---    micro-lote para que la vista siempre sea consistente.
--- ---------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS graph_nodes (
-    node_id     TEXT PRIMARY KEY,
-    label       TEXT NOT NULL CHECK (label IN ('MARCA','USUARIO','HASHTAG','PALABRA','PLATAFORMA')),
-    name        TEXT NOT NULL,
-    weight      BIGINT NOT NULL,
-    pos_count   BIGINT NOT NULL DEFAULT 0,
-    neu_count   BIGINT NOT NULL DEFAULT 0,
-    neg_count   BIGINT NOT NULL DEFAULT 0,
-    sentiment   TEXT NOT NULL,
-    mentions    BIGINT NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS graph_edges (
-    edge_id   TEXT PRIMARY KEY,
-    src       TEXT NOT NULL,
-    dst       TEXT NOT NULL,
-    rel       TEXT NOT NULL,
-    weight    BIGINT NOT NULL,
-    sentiment TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_graph_edges_src ON graph_edges (src);
-CREATE INDEX IF NOT EXISTS idx_graph_edges_dst ON graph_edges (dst);
+-- (el grafo se almacena en Neo4j, ver docker-compose y jobs/graph/neo4j_sink.py)
 
 -- ---------------------------------------------------------------------
 -- 4. Medicion empirica de la complejidad del algoritmo

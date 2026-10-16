@@ -15,6 +15,7 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import db
+from . import neo4j_client
 
 BRAND = os.getenv("BRAND", "Nike")
 
@@ -93,26 +94,7 @@ def trend(minutes: int = Query(30, ge=1, le=1440)) -> dict:
 
 @app.get("/api/graph")
 def graph(limit: int = Query(140, ge=10, le=1000)) -> dict:
-    nodes = db.query(
-        """
-        SELECT node_id, label, name, weight, pos_count, neu_count, neg_count, sentiment
-        FROM graph_nodes
-        ORDER BY (label = 'MARCA') DESC, weight DESC
-        LIMIT %s
-        """,
-        (limit,),
-    )
-    ids = [n["node_id"] for n in nodes]
-    edges = db.query(
-        """
-        SELECT edge_id, src, dst, rel, weight, sentiment
-        FROM graph_edges
-        WHERE src = ANY(%s) AND dst = ANY(%s)
-        ORDER BY weight DESC
-        """,
-        (ids, ids),
-    )
-    return {"nodes": nodes, "edges": edges, "node_count": len(nodes), "edge_count": len(edges)}
+    return neo4j_client.fetch_graph(limit)
 
 
 @app.get("/api/messages")

@@ -67,6 +67,30 @@ services:
   # -------------------------------------------------------------------
   # Postgres: warehouse de sentimiento
   # -------------------------------------------------------------------
+
+  # -------------------------------------------------------------------
+  # Neo4j: grafo de co-ocurrencia
+  # -------------------------------------------------------------------
+  neo4j:
+    image: neo4j:5.23-community
+    <<: *common
+    container_name: bp-neo4j
+    environment:
+      NEO4J_AUTH: ${NEO4J_AUTH}
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+    ports:
+      - "${NEO4J_BOLT_PORT}:7687"
+      - "${NEO4J_HTTP_PORT}:7474"
+    volumes:
+      - neo4j-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u ${NEO4J_USERNAME} -p ${NEO4J_PASSWORD} 'RETURN 1' 2>/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
   postgres:
     image: postgres:16-alpine
     <<: *common
@@ -89,11 +113,12 @@ services:
   # -------------------------------------------------------------------
   # Productor: API sintetica -> topic Kafka
   # -------------------------------------------------------------------
-  producer:
+  producer-x:
     build:
       context: ./producer
     <<: *common
-    container_name: bp-producer
+    container_name: bp-producer-x
+    command: ["python", "-m", "app.producer_x"]
     depends_on:
       kafka:
         condition: service_healthy
@@ -103,8 +128,25 @@ services:
       KAFKA_BROKERS: ${KAFKA_BROKERS}
       KAFKA_TOPIC: ${KAFKA_TOPIC}
       BRAND: ${BRAND}
-      PRODUCER_RATE: ${PRODUCER_RATE}
-      PLATFORMS: ${PLATFORMS}
+      PRODUCER_X_RATE: ${PRODUCER_X_RATE:-12}
+
+  # Productor 2: fuente simulada estilo Reddit -> mismo topic Kafka
+  producer-reddit:
+    build:
+      context: ./producer
+    <<: *common
+    container_name: bp-producer-reddit
+    command: ["python", "-m", "app.producer_reddit"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BROKERS: ${KAFKA_BROKERS}
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      BRAND: ${BRAND}
+      PRODUCER_REDDIT_RATE: ${PRODUCER_REDDIT_RATE:-12}
 
   # -------------------------------------------------------------------
   # Spark: master y worker
@@ -169,6 +211,8 @@ services:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
+      neo4j:
+        condition: service_healthy
       spark-master:
         condition: service_healthy
       spark-worker:
@@ -186,7 +230,11 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_BATCH_SIZE: ${DB_BATCH_SIZE:-500}
       GRAPH_LIMIT: "120"
+      NEO4J_URI: ${NEO4J_URI}
+      NEO4J_USERNAME: ${NEO4J_USERNAME}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
       CHECKPOINT_DIR: /opt/app/checkpoint
     command: >
       bash -c "sleep 10 && /opt/spark/bin/spark-submit
@@ -197,7 +245,7 @@ services:
       --conf spark.driver.memory=768m
       --conf spark.sql.shuffle.partitions=4
       --conf spark.sql.streaming.schemaInference=false
-      /opt/app/jobs/sentiment_stream.py"
+      /opt/app/jobs/consumer.py"
     ports:
       - "4040:4040"
 
@@ -212,6 +260,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      neo4j:
+        condition: service_healthy
     environment:
       POSTGRES_HOST: ${POSTGRES_HOST}
       POSTGRES_PORT: ${POSTGRES_PORT}
@@ -219,6 +269,9 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       BRAND: ${BRAND}
+      NEO4J_URI: ${NEO4J_URI}
+      NEO4J_USERNAME: ${NEO4J_USERNAME}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
     ports:
       - "${API_PORT}:8000"
     healthcheck:
@@ -245,6 +298,7 @@ services:
 volumes:
   kafka-data:
   pg-data:
+  neo4j-data:
 
 networks:
   brandpulse:

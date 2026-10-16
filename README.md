@@ -16,10 +16,10 @@ mismo trabajo que un merge sort, y su complejidad se **mide**, no se enuncia.
 ## Arquitectura
 
 ```
-                 ┌─────────────┐   JSON    ┌──────────────────────────┐
-  API social  →  │  productor  │ ────────► │  Kafka (KRaft, 3 part.)  │
-  (sintética)    │  Python     │  topic    └───────────┬──────────────┘
-                 └─────────────┘  "menciones"          │
+  ┌────────────────────┐   JSON    ┌──────────────────────────┐
+  X simulado ─► productor X ───────┐ │ Kafka (KRaft, 3 part.)   │
+  Reddit sim. ─► productor Reddit ─┴►│ topic "menciones"        │
+                 (Python, paralelos)  └───────────┬──────────────┘
                                                        ▼
                               ┌────────────────────────────────────────┐
                               │  Spark Structured Streaming            │
@@ -32,12 +32,14 @@ mismo trabajo que un merge sort, y su complejidad se **mide**, no se enuncia.
                           ┌───────────────────┴───────────────────┐
                           ▼                                       ▼
                  ┌─────────────────┐                    ┌──────────────────┐
-                 │   Postgres      │  ◄── instantánea ──│  grafo de        │
-                 │   mentions      │      recomputada   │  co-ocurrencia   │
-                 │   complexity    │      por micro-lote│  (nodes/edges)   │
-                 └────────┬────────┘                    └──────────────────┘
-                          │ lee (solo lectura)
-                          ▼
+                 │   Postgres      │                    │  Neo4j           │
+                 │   mentions      │      recomputada   │  grafo de        │
+                 │   complexity    │◄── por micro-lote ─│  co-ocurrencia   │
+                 │   buckets       │   (nodos/aristas)  │  (nodos:MARCA…)  │
+                 └────────┬────────┘                    └────────┬─────────┘
+                          │ lee (solo lectura)                   │ lee
+                          └──────────────┬────────────────────────┘
+                                         ▼
                  ┌─────────────────┐        ┌───────────────────────────┐
                  │  API FastAPI    │ ◄────► │  Dashboard React (nginx)  │
                  └─────────────────┘  /api  │  KPIs · tendencia · grafo │
@@ -50,9 +52,11 @@ Servicios (Docker Compose, red `brandpulse`):
 |---|---|---|
 | `kafka` | `apache/kafka:3.9.0` | broker en modo KRaft (sin ZooKeeper) |
 | `postgres` | `postgres:16-alpine` | warehouse de sentimiento |
-| `producer` | `python:3.11-slim` | genera y publica menciones sintéticas |
+| `neo4j` | `neo4j:5.23-community` | grafo de co-ocurrencia (nodos/aristas) |
+| `producer-x` | `python:3.11-slim` | primera fuente simulada (X) |
+| `producer-reddit` | `python:3.11-slim` | segunda fuente simulada (Reddit) |
 | `spark-master` / `spark-worker` | `./spark` | cluster de Spark |
-| `spark-job` | `./spark` | job de Structured Streaming |
+| `spark-job` | `./spark` | consumidor único Spark Structured Streaming (`consumer.py`) |
 | `api` | `./api` | REST de solo lectura |
 | `frontend` | `./frontend` | dashboard estático + proxy `/api` |
 
@@ -117,18 +121,81 @@ peso antes de la reducción final.
 
 ---
 
-## El grafo de co-ocurrencia
+## El grafo de co-ocurrencia (Neo4j)
 
-Es una **vista derivada** de `mentions`: en cada micro-lote se recalcula completo
-y se reemplaza dentro de una transacción (`DELETE` + `INSERT`). Eso lo hace
-**idempotente** (un reintento de Spark no duplica aristas) y siempre consistente
-con los hechos.
+El grafo **no se materializa en Postgres**: vive en **Neo4j**, un servicio más
+de Docker Compose (`neo4j`, imagen `neo4j:5.23-community`). No hay que instalar
+nada en la máquina anfitriona.
 
-* **Nodos**: `MARCA`, `USUARIO`, `HASHTAG`, `PALABRA`, `PLATAFORMA`, con peso
-  (`COUNT`), desglose pos/neu/neg y sentimiento promedio.
-* **Aristas**: `MENCIONA`, `PUBLICA`, `ETIQUETA`, `APARECE_EN`, `USA`.
-* El frontend lo dibuja con **Cytoscape + layout cose-bilkent** (force-directed),
-  coloreando nodos por tipo y bordeando por sentimiento promedio.
+* **Bolt** (driver): `neo4j://neo4j:7687` dentro de la red `brandpulse`, y
+  `localhost:7687` desde el host.
+* **Neo4j Browser**: http://localhost:7474 (usuario `neo4j`, password `NEO4J_PASSWORD` del `.env`).
+
+### Cómo se construye: siembra + incremental
+
+Es una **vista derivada** de `mentions`, pero en vez de reconstruirse completa
+en cada micro-lote, **crece en vivo**:
+
+1. **Siembra (`seed_graph`)** — al arrancar el job, una sola vez, Spark agrega el
+   histórico de `mentions` y reconstruye todo el grafo. Así no se pierde lo ya
+   procesado aunque el `spark-job` se reinicie.
+2. **Incremental (`apply_delta`)** — en cada micro-lote los executors traducen las
+   menciones nuevas a contribuciones (nodos y aristas con su peso y sentimiento)
+   y el driver las **suma** a Neo4j con `MERGE` + `+=`. El grafo se ve crecer
+   lote a lote.
+
+```
+  mentions (Postgres)                    Neo4j
+        │                                   ▲
+        │  seed_graph (1 vez al arrancar)   │  MATCH (n) DETACH DELETE n
+        └───────────────────────────────────┤  + MERGE de la instantánea
+                                            │
+   micro-lote ─► analyze_partition          │  apply_delta (idempotente)
+   (executors)   calcula el delta ──────────┘  MERGE + weight += …
+```
+
+**Idempotencia.** Spark puede reintentar un micro-lote. Para no contar dos veces
+el mismo lote, `apply_delta` deja un nodo marcador `(:Batch {id})`; si ya existe,
+no hace nada. El marcador y los incrementos se escriben en la **misma
+transacción**, así que un reintento nunca duplica pesos. `seed_graph` borra los
+nodos del grafo pero conserva los marcadores de lote.
+
+### Modelo
+
+* **Nodos** (etiqueta nativa de Neo4j): `MARCA`, `USUARIO`, `HASHTAG`,
+  `PALABRA`, `PLATAFORMA`. Propiedades: `weight`, `pos_count`, `neu_count`,
+  `neg_count`, `score_sum` y `sentiment` (derivado de `score_sum / weight`).
+* **Aristas**: tipo `REL` con propiedad `rel` (`MENCIONA`, `PUBLICA`,
+  `ETIQUETA`, `APARECE_EN`, `USA`, `CON_HASHTAG`, `EN_PLATAFORMA`) más `weight`,
+  `score_sum` y `sentiment`.
+* **Marcadores internos**: `(:Batch {id})` (idempotencia). La API los filtra, no
+  se ven en el dashboard.
+
+### Qué archivos se agregaron/cambiaron
+
+| Archivo | Rol |
+|---|---|
+| `docker-compose.yml` | servicio `neo4j`, volumen `neo4j-data` y variables `NEO4J_*` |
+| `spark/jobs/graph/neo4j_sink.py` | `seed_graph` y `apply_delta` (Cypher) |
+| `spark/jobs/sinks/postgres.py` | `GraphDelta`/`PartitionState` y armado del delta en `analyze_partition` |
+| `spark/jobs/sentiment_stream.py` | siembra al arrancar + `apply_graph` por micro-lote |
+| `spark/jobs/config.py` | `Neo4jConfig` (`NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`) |
+| `api/app/neo4j_client.py` | lee el grafo desde Neo4j para `/api/graph` |
+| `db/init/01_schema.sql` | se quitaron las tablas `graph_nodes`/`graph_edges` |
+
+### Inspeccionarlo a mano
+
+En Neo4j Browser (http://localhost:7474):
+
+```cypher
+MATCH (n) WHERE NOT n:Batch RETURN n LIMIT 100;                 // nodos
+MATCH (m:MARCA)-[r:REL]-(x) RETURN m, r, x LIMIT 100;           // vecinos de la marca
+MATCH (n) WHERE NOT n:Batch RETURN labels(n), count(*);         // cuántos por tipo
+MATCH (b:Batch) RETURN count(b);                                // lotes aplicados
+```
+
+El frontend lo dibuja con **Cytoscape + layout cose-bilkent** (force-directed),
+coloreando nodos por tipo y bordeando por sentimiento promedio.
 
 ---
 
@@ -145,6 +212,7 @@ docker compose ps          # esperar a que kafka/postgres/spark estén healthy
 * Dashboard: http://localhost:5173
 * API: http://localhost:8000/api/health
 * Spark UI: http://localhost:8080
+* Neo4j Browser: http://localhost:7474 (usuario `neo4j`, password definida en `.env`)
 * Kafka (desde el host): `localhost:9094`
 
 ### En Windows
@@ -200,20 +268,69 @@ instalar Docker Desktop: el PATH se agrega al final de la instalación.
 de Linux: `cp .env.example .env && docker compose up --build -d`. Es la opción
 más cómoda si ya usás la terminal de Ubuntu.
 
-El productor empieza a publicar apenas Kafka está disponible y Spark cierra un
-micro-lote cada `SPARK_TRIGGER` segundos (10 por defecto). En ~1 minuto ya hay
-KPIs, tendencia y grafo.
+Los dos productores arrancan en paralelo y publican en el mismo topic Kafka.
+Cada mensaje lleva `source` (`x_api_simulada` o `reddit_api_simulada`) para
+identificar su origen. El consumidor `consumer.py` lee ambas fuentes; Spark
+cierra un micro-lote cada `SPARK_TRIGGER` segundos (10 por defecto), analiza
+las menciones y las inserta en PostgreSQL en grupos de `DB_BATCH_SIZE` filas
+(500 por defecto). El destino es la base relacional PostgreSQL, no archivos.
+
+Para ejecutar o revisar cada productor por separado:
+
+```bash
+docker compose up -d producer-x producer-reddit spark-job
+docker compose logs -f producer-x producer-reddit spark-job
+```
+
+El `DB_BATCH_SIZE` se configura en `.env`. La clase `DatabaseConfig` construye
+la configuración de PostgreSQL desde las variables `POSTGRES_*`; la clase
+`BatchedPostgresWriter` recibe esa configuración en su constructor, abre la
+conexión y ejecuta las inserciones SQL por lotes. Para verificar que llegan
+datos de los dos orígenes:
+
+```sql
+SELECT source, platform, COUNT(*) AS menciones
+FROM mentions
+GROUP BY source, platform
+ORDER BY source;
+```
+
+Si ya se había iniciado PostgreSQL antes de esta actualización, aplica una vez
+la migración de la columna `source` al volumen existente:
+
+```bash
+docker compose exec -T postgres psql -U marketing -d brandpulse \
+  -c "ALTER TABLE mentions ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'desconocida';"
+```
+
+### Compartir el dashboard con dos personas
+
+Los dos usuarios abren **la misma URL del dashboard**; ambos ven el mismo
+backend, los mismos eventos y las mismas filas de PostgreSQL del equipo que
+ejecuta Docker. No se debe iniciar una copia local del proyecto en cada equipo.
+
+1. En el escritorio anfitrión, inicia el proyecto con `docker compose up --build -d`.
+2. En VS Code conectado al entorno que ejecuta Docker, abre **Ports** y elige
+   **Forward a Port**. Escribe el puerto `5173` (o el valor de `WEB_PORT`).
+3. Cambia la visibilidad del puerto reenviado a **Public** y copia la URL HTTPS
+   que muestra VS Code. Esa es la URL que se comparte con la segunda persona.
+4. La segunda persona abre esa misma URL en su navegador. Mantén Docker y el
+   entorno anfitrión encendidos mientras se conectan.
+
+La dirección pública la asigna VS Code al crear el reenvío en el equipo o
+entorno remoto que ejecuta el proyecto. No existe hasta que se inicia el
+servicio y se reenvía el puerto. Si se usa VS Code local sin un entorno remoto
+con reenvío público, se necesita un túnel público configurado en ese equipo;
+una dirección `localhost` solo funciona en el mismo equipo.
 
 Para escalar el volumen:
 
 ```bash
-PRODUCER_RATE=200 docker compose up -d producer
-docker compose up -d --scale spark-worker=2   # (ajustar cores/memoria)
+PRODUCER_X_RATE=100 PRODUCER_REDDIT_RATE=100 docker compose up -d --force-recreate producer-x producer-reddit
 ```
 
-O más simple y multiplataforma: cambiá `PRODUCER_RATE` en `.env` y recreá el
-servicio. En Windows con PowerShell, `PRODUCER_RATE=200 docker compose up -d`
-**no** funciona (esa sintaxis es de bash); usá el `.env`.
+También se pueden cambiar ambos valores en `.env` y recrear los servicios.
+En PowerShell, edita `.env` en vez de anteponer variables con sintaxis Bash.
 
 ---
 
@@ -263,16 +380,20 @@ proyecto-kafka/
 ├── .env.example                   # plantilla (copiar a .env)
 ├── .gitattributes                 # fuerza LF: necesario en Windows/WSL2
 ├── db/init/01_schema.sql          # tablas, vistas, índices
-├── producer/app/                  # corpus sintético + publisher Kafka
+├── producer/app/                  # productor base + fuentes X y Reddit
+│   ├── producer_x.py              # productor 1
+│   ├── producer_reddit.py         # productor 2
 ├── spark/
 │   ├── Dockerfile                 # venv + conectores Kafka en $SPARK_HOME/jars
 │   └── jobs/
-│       ├── sentiment_stream.py    # Structured Streaming (foreachBatch)
+│       ├── consumer.py            # consumidor único de Spark
+│       ├── sentiment_stream.py    # lógica Structured Streaming (foreachBatch)
 │       ├── config.py
 │       ├── algorithms/            # merge_sort, complexity, sentiment_dnc
 │       ├── text/                  # normalización y lexicones
-│       ├── graph/builder.py       # SQL de la instantánea del grafo
-│       └── sinks/postgres.py      # escritura distribuida + telemetría
+│       ├── graph/builder.py       # SQL de la serie por minuto (buckets)
+│       ├── graph/neo4j_sink.py    # reconstruye el grafo en Neo4j (Cypher)
+│       └── sinks/postgres.py      # escritura SQL por lotes + telemetría
 ├── api/app/                       # FastAPI (solo lectura)
 └── frontend/src/                  # React + Vite + Cytoscape + Recharts
 ```
